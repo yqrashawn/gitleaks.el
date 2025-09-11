@@ -1,0 +1,5 @@
+#+title: gitleaks.el
+
+[[https://github.com/gitleaks/gitleaks#readme][gitleaks]] elisp wrapper
+
+I use this to filter buffers before sending them to LLM
