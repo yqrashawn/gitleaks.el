@@ -18,6 +18,7 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'json)
 (require 'seq)
 
@@ -49,14 +50,6 @@ Findings in the baseline will be ignored in subsequent scans."
           (file :tag "Baseline file path"))
   :group 'gitleaks)
 
-(defcustom gitleaks-report-format "json"
-  "Default report format for gitleaks output."
-  :type '(choice (const "json")
-          (const "csv")
-          (const "junit")
-          (const "sarif"))
-  :group 'gitleaks)
-
 (defcustom gitleaks-default-flags (list "--redact=100")
   "Additional command line flags to pass to gitleaks."
   :type '(repeat string)
@@ -79,7 +72,6 @@ Findings in the baseline will be ignored in subsequent scans."
   "If current user command is redact command")
 
 ;;; Utility functions
-
 (defun gitleaks--point-at-line-col (line col)
   "Return point at LINE and COL (both 1-based)."
   (save-excursion
@@ -99,26 +91,29 @@ Findings in the baseline will be ignored in subsequent scans."
   "Build a gitleaks command with SUBCOMMAND and TARGET.
 
 EXTRA-ARGS is a list of additional arguments to pass to gitleaks."
-  (let ((cmd (list (gitleaks--executable) subcommand "--no-banner" "--no-color")))
+  (let* ((tmpf (make-temp-file "gitleaks-" nil ".json"))
+         (cmd (list (gitleaks--executable) subcommand
+                    "--no-banner"
+                    "--no-color"
+                    "--log-level=fatal"
+                    "--report-format=json"
+                    "--report-path" tmpf)))
     ;; Add configuration file if specified
     (when gitleaks-config-file
       (setq cmd (append cmd (list "--config" (expand-file-name gitleaks-config-file)))))
-    
+
     ;; Add baseline file if specified
     (when gitleaks-baseline-file
       (setq cmd (append cmd (list "--baseline-path" (expand-file-name gitleaks-baseline-file)))))
-    
-    ;; Add report format
-    (setq cmd (append cmd (list "--report-format" gitleaks-report-format)))
-    
+
     ;; Add default flags
     (when gitleaks-default-flags
       (setq cmd (append cmd gitleaks-default-flags)))
-    
+
     ;; Add extra arguments
     (when extra-args
       (setq cmd (append cmd extra-args)))
-    
+
     ;; Add target
     (when target
       (setq cmd (append cmd (list target))))
@@ -129,7 +124,7 @@ EXTRA-ARGS is a list of additional arguments to pass to gitleaks."
              (lambda (s) (string-prefix-p "--redact" s))
              cmd)))
 
-    cmd))
+    (list cmd tmpf)))
 
 (defun gitleaks--wait-process (proc &optional timeout)
   "Block until PROC exits or TIMEOUT seconds passes. Return exit code or TIMEOUT."
@@ -175,20 +170,16 @@ Returns the process object."
 (defun gitleaks--format-finding (finding)
   "Format a single gitleaks FINDING for display."
   (let-alist finding
-    (format "File: %s:%d\nRule: %s\nSecret: %s\nDescription: %s\nCommit: %s\nAuthor: %s\nDate: %s\n%s\n"
-            (or .RuleID "<unknown>")
-            (or .Description "<no description>")
-            (or .File "<unknown>")
-            (or .StartLine 0)
-            (or .EndLine 0)
-            (or .StartColumn 0)
-            (or .EndColumn 0)
-            (or .Match "<redacted>")
-            (or .Secret "<redacted>")
-            (or .Commit "<no commit>")
-            (or .Author "<unknown>")
-            (or .Date "<unknown>")
-            (make-string 80 ?-))))
+    (format
+     "Rule: %s\nSecret: %s\nDescription: %s\nStartLine: %d\nEndLine: %d\nStartColumn: %d\nEndColumn: %d\n%s\n"
+     (or .RuleID "<unknown>")
+     (or .Secret "<redacted>")
+     (or .Description "<no description>")
+     (or .StartLine 0)
+     (or .EndLine 0)
+     (or .StartColumn 0)
+     (or .EndColumn 0)
+     (make-string 80 ?-))))
 
 (defun gitleaks--display-results (results)
   "Display gitleaks RESULTS in a buffer."
@@ -198,7 +189,9 @@ Returns the process object."
         (erase-buffer)
         (if results
             (progn
-              (insert (format "Gitleaks found %d potential secret(s):\n\n" (length results)))
+              (insert
+               (format "Gitleaks found %d potential secret(s):\n\n"
+                       (length results)))
               (dolist (finding results)
                 (insert (gitleaks--format-finding finding)))
               (insert "\n\nScan completed.\n"))
@@ -217,7 +210,7 @@ Returns a new string with secrets replaced by =REDACTED=."
       (dolist (finding findings)
         (let-alist finding
           (when .Secret
-            (setq result (replace-regexp-in-string 
+            (setq result (replace-regexp-in-string
                           (regexp-quote .Secret)
                           "==REDACTED=="
                           result)))))
@@ -225,17 +218,37 @@ Returns a new string with secrets replaced by =REDACTED=."
 
 ;;; Core scanning functions
 
+(defun gitleaks--scan-buffer (buffer)
+  "Core function to scan BUFFER content for secrets using gitleaks.
+
+Returns a list of findings or nil if no secrets found."
+  (let* ((content (with-current-buffer buffer (buffer-string)))
+         results)
+    (unwind-protect
+        (pcase-let
+            ((`(,cmd ,tmpf) (gitleaks--build-command "stdin" nil))
+             (process-connection-type nil))
+          (setq gitleaks--last-command cmd)
+          (let ((proc (apply #'start-process "gitleaks" nil cmd)))
+            (set-process-coding-system proc 'utf-8 'utf-8)
+            (process-send-string proc content)
+            (process-send-eof proc)
+            (gitleaks--wait-process proc (+ (float-time) 10))
+            (let ((json-content
+                   (with-temp-buffer
+                     (insert-file-contents tmpf)
+                     (buffer-string))))
+              (setq results (gitleaks--parse-json-results json-content)))))
+      nil)
+    results))
+
 (defun gitleaks-scan-string (string)
   "Scan STRING for secrets using gitleaks.
 
 Returns a list of findings or nil if no secrets found."
-  (let ((temp-file (make-temp-file "gitleaks-scan-" nil ".txt")))
-    (unwind-protect
-        (progn
-          (with-temp-file temp-file
-            (insert string))
-          (gitleaks-scan-file temp-file))
-      (delete-file temp-file))))
+  (with-temp-buffer
+    (insert string)
+    (gitleaks--scan-buffer (current-buffer))))
 
 (defun gitleaks-scan-buffer (&optional buffer)
   "Scan BUFFER (or current buffer) for secrets using gitleaks.
@@ -249,11 +262,11 @@ Returns a list of findings or nil if no secrets found."
             (progn
               (message "Buffer is empty")
               nil)
-          (let ((results (gitleaks-scan-string content)))
+          (let ((results (gitleaks--scan-buffer buffer)))
             (setq gitleaks--last-results results)
             (when (called-interactively-p 'interactive)
               (gitleaks--display-results results)
-              (message "Gitleaks scan completed. Found %d potential secret(s)." 
+              (message "Gitleaks scan completed. Found %d potential secret(s)."
                        (length (or results nil))))
             results))))))
 
@@ -264,25 +277,14 @@ Returns a list of findings or nil if no secrets found."
   (interactive "fFile to scan: ")
   (unless (file-exists-p file)
     (error "File does not exist: %s" file))
-  (let* ((temp-output (make-temp-file "gitleaks-output-" nil ".json"))
-         (command (gitleaks--build-command "dir" 
-                                           (expand-file-name file)
-                                           (list "--report-path" temp-output)))
-         (process (gitleaks--run-command command))
-         results)
-    (gitleaks--wait-process process)
-    (unwind-protect
-        (when (file-exists-p temp-output)
-          (let ((json-content (with-temp-buffer
-                                (insert-file-contents temp-output)
-                                (buffer-string))))
-            (setq results (gitleaks--parse-json-results json-content))))
-      (when (file-exists-p temp-output)
-        (delete-file temp-output)))
+  (let (results)
+    (with-temp-buffer
+      (insert-file-contents file)
+      (setq results (gitleaks--scan-buffer (current-buffer))))
     (setq gitleaks--last-results results)
     (when (called-interactively-p 'interactive)
       (gitleaks--display-results results)
-      (message "Gitleaks scan completed. Found %d potential secret(s)." 
+      (message "Gitleaks scan completed. Found %d potential secret(s)."
                (length (or results nil))))
     results))
 
@@ -293,12 +295,11 @@ Returns a list of findings or nil if no secrets found."
   (interactive "DDirectory to scan: ")
   (unless (file-directory-p directory)
     (error "Directory does not exist: %s" directory))
-  (let* ((temp-output (make-temp-file "gitleaks-output-" nil ".json"))
-         (command (gitleaks--build-command "dir"
-                                           (expand-file-name directory)
-                                           (list "--report-path" temp-output)))
-         (process (gitleaks--run-command command))
-         results)
+  (pcase-let*
+      ((`(,command ,temp-output)
+        (gitleaks--build-command "dir" (expand-file-name directory)))
+       (process (gitleaks--run-command command))
+       (results))
     (gitleaks--wait-process process)
     (unwind-protect
         (when (file-exists-p temp-output)
@@ -321,16 +322,14 @@ Returns a list of findings or nil if no secrets found."
 If REPOSITORY is nil, scan the current git repository.
 Returns a list of findings or nil if no secrets found."
   (interactive)
-  (let* ((repo-dir (or repository 
-                       (and (bound-and-true-p vc-mode)
-                            (vc-find-root default-directory ".git"))
-                       default-directory))
-         (temp-output (make-temp-file "gitleaks-output-" nil ".json"))
-         (command (gitleaks--build-command "git" 
-                                           (expand-file-name repo-dir)
-                                           (list "--report-path" temp-output)))
-         (process (gitleaks--run-command command))
-         results)
+  (pcase-let* ((repo-dir (or repository
+                             (and (bound-and-true-p vc-mode)
+                                  (vc-find-root default-directory ".git"))
+                             default-directory))
+               (`(,command ,temp-output)
+                (gitleaks--build-command "git" (expand-file-name repo-dir)))
+               (process (gitleaks--run-command command))
+               (results))
     (gitleaks--wait-process process)
     (unwind-protect
         (when (file-exists-p temp-output)
@@ -343,7 +342,7 @@ Returns a list of findings or nil if no secrets found."
     (setq gitleaks--last-results results)
     (when (called-interactively-p 'interactive)
       (gitleaks--display-results results)
-      (message "Gitleaks scan completed. Found %d potential secret(s)." 
+      (message "Gitleaks scan completed. Found %d potential secret(s)."
                (length (or results nil))))
     results))
 
@@ -399,16 +398,6 @@ All detected secrets are replaced with =REDACTED=."
         redacted-buffer))))
 
 ;;; Interactive commands
-
-;;;###autoload
-(defun gitleaks-scan-current-file ()
-  "Scan the current file for secrets."
-  (interactive)
-  (let ((file (buffer-file-name)))
-    (if file
-        (gitleaks-scan-file file)
-      (error "Current buffer is not associated with a file"))))
-
 ;;;###autoload
 (defun gitleaks-scan-project ()
   "Scan the current project for secrets."
@@ -429,7 +418,7 @@ All detected secrets are replaced with =REDACTED=."
       (let ((content (buffer-substring-no-properties start end)))
         (let ((results (gitleaks-scan-string content)))
           (gitleaks--display-results results)
-          (message "Gitleaks scan completed. Found %d potential secret(s)." 
+          (message "Gitleaks scan completed. Found %d potential secret(s)."
                    (length (or results nil)))))
     (error "No region selected")))
 
@@ -456,29 +445,6 @@ All detected secrets are replaced with =REDACTED=."
       (gitleaks--wait-process process)
       (with-current-buffer (process-buffer process)
         (string-trim (buffer-string))))))
-
-(defun gitleaks-generate-baseline (&optional output-file)
-  "Generate a baseline file for future scans.
-
-If OUTPUT-FILE is provided, save the baseline to that file.
-Otherwise, prompt for a file location."
-  (interactive)
-  (let* ((output (or output-file
-                     (read-file-name "Save baseline to: " nil "gitleaks-baseline.json")))
-         (project-root (or (and (fboundp 'project-root)
-                                (project-current)
-                                (project-root (project-current)))
-                           (and (bound-and-true-p vc-mode)
-                                (vc-find-root default-directory ".git"))
-                           default-directory))
-         (command (gitleaks--build-command "git" 
-                                           project-root
-                                           (list "--report-path" (expand-file-name output))))
-         (process (gitleaks--run-command command)))
-    (gitleaks--wait-process process)
-    (if (file-exists-p output)
-        (message "Baseline saved to: %s" output)
-      (message "Failed to generate baseline"))))
 
 (provide 'gitleaks)
 ;;; gitleaks.el ends here
